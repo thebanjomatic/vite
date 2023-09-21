@@ -29,6 +29,7 @@ import { ESBUILD_MODULES_TARGET } from '../constants'
 import { esbuildCjsExternalPlugin, esbuildDepPlugin } from './esbuildDepPlugin'
 import { resolveTsconfigRaw, scanImports } from './scan'
 import { createOptimizeDepsIncludeResolver, expandGlobIds } from './resolve'
+import { esbuildCssBundlePlugin } from './esbuildCssBundlePlugin'
 export {
   initDepsOptimizer,
   initDevSsrDepsOptimizer,
@@ -37,8 +38,8 @@ export {
 
 const debug = createDebugger('vite:deps')
 
-const jsExtensionRE = /\.js$/i
-const jsMapExtensionRE = /\.js\.map$/i
+const jsCssExtensionRE = /\.js|\.css$/i
+const jsCssMapExtensionRE = /\.(?:js|css)\.map$/i
 
 export type ExportsData = {
   hasImports: boolean
@@ -134,6 +135,22 @@ export interface DepOptimizationConfig {
    * @experimental
    */
   noDiscovery?: boolean
+  /**
+   * When set to `true`, optimized dependencies that contain .css imports will
+   * have the css extracted and bundled in a separate file. This is useful for
+   * reducingthe number of small css requests coming from component-libraries,
+   * etc, replacing it instead with a single large css bundle request per
+   * dependency.
+   *
+   * Since the css bundle produced is not able to be tree-shaken for production
+   * builds, this default behavior if this option is not overrided is enabled
+   * for 'dev', and disabled for 'build'. That way, an optimized 'build' will
+   * externalize the css requests from dependencies so that the individual css
+   * imports may be tree-shaken away during the build.
+   *
+   * @default true for 'dev', false for 'build'
+   */
+  cssBundle?: boolean
 }
 
 export type DepOptimizationOptions = DepOptimizationConfig & {
@@ -174,6 +191,7 @@ export interface DepOptimizationProcessing {
 export interface OptimizedDepInfo {
   id: string
   file: string
+  cssBundle?: string
   src?: string
   needsInterop?: boolean
   browserHash?: string
@@ -616,21 +634,31 @@ export function runOptimizeDeps(
           processingCacheDir,
         )
 
+        const extractCssBundleId = (output: { cssBundle?: string }) =>
+          output.cssBundle
+            ? flattenId(
+                path.relative(processingCacheDirOutputPath, output.cssBundle),
+              )
+            : undefined
+
         for (const id in depsInfo) {
           const output = esbuildOutputFromId(
             meta.outputs,
             id,
             processingCacheDir,
-          )
+          )!
 
           const { exportsData, ...info } = depsInfo[id]
+          const cssBundle = extractCssBundleId(output)
           addOptimizedDepInfo(metadata, 'optimized', {
             ...info,
+            cssBundle,
             // We only need to hash the output.imports in to check for stability, but adding the hash
             // and file path gives us a unique hash that may be useful for other things in the future
             fileHash: getHash(
               metadata.hash +
                 depsInfo[id].file +
+                cssBundle +
                 JSON.stringify(output.imports),
             ),
             browserHash: metadata.browserHash,
@@ -647,20 +675,24 @@ export function runOptimizeDeps(
         }
 
         for (const o of Object.keys(meta.outputs)) {
-          if (!o.match(jsMapExtensionRE)) {
+          if (!o.match(jsCssMapExtensionRE)) {
             const id = path
               .relative(processingCacheDirOutputPath, o)
-              .replace(jsExtensionRE, '')
-            const file = getOptimizedDepPath(id, resolvedConfig, ssr)
+              .replace(jsCssExtensionRE, '')
+
+            const ext = path.extname(o)
+            const file = getOptimizedDepPath(id, resolvedConfig, ssr, ext)
             if (
               !findOptimizedDepInfoInRecord(
                 metadata.optimized,
                 (depInfo) => depInfo.file === file,
               )
             ) {
+              const cssBundle = extractCssBundleId(meta.outputs[o])
               addOptimizedDepInfo(metadata, 'chunks', {
-                id,
+                id: ext === '.css' ? `${id}_css` : id,
                 file,
+                cssBundle,
                 needsInterop: false,
                 browserHash: metadata.browserHash,
               })
@@ -731,6 +763,8 @@ async function prepareEsbuildOptimizerRun(
 
   const optimizeDeps = getDepOptimizationConfig(config, ssr)
 
+  const cssBundle = optimizeDeps?.cssBundle ?? (isBuild ? false : true)
+
   const {
     plugins: pluginsFromConfig = [],
     tsconfig,
@@ -799,7 +833,10 @@ async function prepareEsbuildOptimizerRun(
   if (external.length) {
     plugins.push(esbuildCjsExternalPlugin(external, platform))
   }
-  plugins.push(esbuildDepPlugin(flatIdDeps, external, config, ssr))
+  plugins.push(esbuildDepPlugin(flatIdDeps, external, config, ssr, cssBundle))
+  if (cssBundle) {
+    plugins.push(esbuildCssBundlePlugin())
+  }
 
   const context = await esbuild.context({
     absWorkingDir: process.cwd(),
@@ -917,9 +954,10 @@ export function getOptimizedDepPath(
   id: string,
   config: ResolvedConfig,
   ssr: boolean,
+  ext: string = '.js',
 ): string {
   return normalizePath(
-    path.resolve(getDepsCacheDir(config, ssr), flattenId(id) + '.js'),
+    path.resolve(getDepsCacheDir(config, ssr), flattenId(id) + ext),
   )
 }
 
@@ -1058,11 +1096,12 @@ function stringifyDepsOptimizerMetadata(
       browserHash,
       optimized: Object.fromEntries(
         Object.values(optimized).map(
-          ({ id, src, file, fileHash, needsInterop }) => [
+          ({ id, src, file, cssBundle, fileHash, needsInterop }) => [
             id,
             {
               src,
               file,
+              cssBundle,
               fileHash,
               needsInterop,
             },
@@ -1070,7 +1109,10 @@ function stringifyDepsOptimizerMetadata(
         ),
       ),
       chunks: Object.fromEntries(
-        Object.values(chunks).map(({ id, file }) => [id, { file }]),
+        Object.values(chunks).map(({ id, file, cssBundle }) => [
+          id,
+          { file, cssBundle },
+        ]),
       ),
     },
     (key: string, value: string) => {
@@ -1085,11 +1127,11 @@ function stringifyDepsOptimizerMetadata(
   )
 }
 
-function esbuildOutputFromId(
-  outputs: Record<string, any>,
+function esbuildOutputFromId<T>(
+  outputs: Record<string, T>,
   id: string,
   cacheDirOutputPath: string,
-): any {
+): T | undefined {
   const cwd = process.cwd()
   const flatId = flattenId(id) + '.js'
   const normalizedOutputPath = normalizePath(
@@ -1298,6 +1340,10 @@ export async function optimizedDepNeedsInterop(
   config: ResolvedConfig,
   ssr: boolean,
 ): Promise<boolean | undefined> {
+  if (file.endsWith('.css')) {
+    return false
+  }
+
   const depInfo = optimizedDepInfoFromFile(metadata, file)
   if (depInfo?.src && depInfo.needsInterop === undefined) {
     depInfo.exportsData ??= extractExportsData(depInfo.src, config, ssr)
